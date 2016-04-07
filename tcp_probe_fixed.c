@@ -69,6 +69,7 @@ struct tcp_log {
 	u32	snd_nxt;
 	u32	snd_una;
 	u32	snd_wnd;
+	u32 rcv_wnd;
 	u32	snd_cwnd;
 	u32	ssthresh;
 	u32	srtt;
@@ -99,6 +100,7 @@ static inline void copy_to_tcp_probe(const struct sock *sk, const struct sk_buff
 	p->snd_una = tp->snd_una;
 	p->snd_cwnd = tp->snd_cwnd;
 	p->snd_wnd = tp->snd_wnd;
+	p->rcv_wnd = tp->rcv_wnd;
 	p->ssthresh = tcp_current_ssthresh(sk);
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(3,14,0)
 	p->srtt = tp->srtt >> 3;
@@ -117,13 +119,13 @@ static inline int tcpprobe_sprint(const struct tcp_log *p, char *tbuf, int n)
 		= ktime_to_timespec(ktime_sub(ktime_get(), tcp_probe.start));
 
 	int ret = scnprintf(tbuf, n,
-			"%lu.%09lu %pI4:%u %pI4:%u %d %#x %#x %u %u %u %u\n",
+			"%lu.%09lu %pI4:%u %pI4:%u %d %#x %#x %u %u %u %u %u\n",
 			(unsigned long) tv.tv_sec,
 			(unsigned long) tv.tv_nsec,
 			&p->saddr, ntohs(p->sport),
 			&p->daddr, ntohs(p->dport),
 			p->length, p->snd_nxt, p->snd_una,
-			p->snd_cwnd, p->ssthresh, p->snd_wnd, p->srtt);
+			p->snd_cwnd, p->rcv_wnd, p->ssthresh, p->snd_wnd, p->srtt);
 
 	return ret;
 }
