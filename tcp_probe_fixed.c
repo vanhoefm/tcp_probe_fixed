@@ -243,7 +243,7 @@ static ssize_t tcpprobe_read(struct file *file, char __user *buf,
 	if (!buf)
 		return -EINVAL;
 
-	while (eventbuf >= 0 && cnt < len) {
+	while (eventbuf > 0 && cnt < len) {
 		char tbuf[163];
 		int width = 0;
 		unsigned long head, tail;
