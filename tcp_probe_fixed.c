@@ -32,6 +32,7 @@
 #include <linux/circ_buf.h>
 #include <net/net_namespace.h>
 #include <net/net_namespace.h>
+#include <linux/version.h>
 
 #include <net/tcp.h>
 
@@ -99,8 +100,12 @@ static inline void copy_to_tcp_probe(const struct sock *sk, const struct sk_buff
 	p->snd_cwnd = tp->snd_cwnd;
 	p->snd_wnd = tp->snd_wnd;
 	p->ssthresh = tcp_current_ssthresh(sk);
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,14,0)
+	p->srtt = tp->srtt >> 3;
+#else
 	p->srtt = tp->srtt_us >> 3;
-	
+#endif
+
 	p->length = skb == NULL ? 0 : skb->len;
 	
 	return;	
