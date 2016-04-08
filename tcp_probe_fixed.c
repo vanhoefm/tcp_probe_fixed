@@ -36,14 +36,16 @@
 
 #include <net/tcp.h>
 
+
+
 /* maximum amount of probes to be buffered before forced-output
  * to userspace
  */
 // TODO make module parameter
 #define EVENT_BUF 1
 
-MODULE_AUTHOR("Stephen Hemminger <shemminger@linux-foundation.org>");
-MODULE_DESCRIPTION("TCP cwnd snooper");
+MODULE_AUTHOR("A human, not a dog!");
+MODULE_DESCRIPTION("TCP-Window Inspector");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("1.1");
 
@@ -61,19 +63,38 @@ module_param(full, int, 0);
 
 static const char procname[] = "tcpprobe";
 
+enum LogType {
+	LogType_Rx,
+	LogType_Tx,
+	LogType_Stats
+};
+
+const char *logtype2str(enum LogType type)
+{
+	switch (type) {
+	case LogType_Rx:    return "RECV";
+	case LogType_Tx:    return "XMIT";
+	case LogType_Stats: return "INFO";
+	}
+
+	return "??";
+}
+
 struct tcp_log {
-	ktime_t tstamp;
-	__be32	saddr, daddr;
-	__be16	sport, dport;
-	u16	length;
-	u32	snd_nxt;
-	u32	snd_una;
-	u32	snd_wnd;
-	u32 rcv_wnd;
-    u32 packets_out;
-	u32	snd_cwnd;
-	u32	ssthresh;
-	u32	srtt;
+	ktime_t 	tstamp;
+	enum LogType	type;
+	__be32		saddr, daddr;
+	__be16		sport, dport;
+	u16		length;
+	u32		snd_nxt;
+	u32		snd_una;
+	u32		snd_wnd;
+	u32		rcv_wnd;
+	u32		packets_out;
+	u32		snd_cwnd;
+	u32		ssthresh;
+	u32		icsk_rto;
+	u32		srtt;
 };
 
 static struct {
@@ -87,11 +108,12 @@ static struct {
 } tcp_probe;
 
 /* copies the probe data from the socket */
-static inline void copy_to_tcp_probe(const struct sock *sk, const struct sk_buff *skb, struct tcp_log *p) {
+static inline void copy_to_tcp_probe(const struct sock *sk, const struct sk_buff *skb, struct tcp_log *p, enum LogType type) {
 
 	const struct tcp_sock *tp = tcp_sk(sk);
 	const struct inet_sock *inet = inet_sk(sk);
 	
+	p->type = type;
 	p->tstamp = ktime_get();
 	p->saddr = inet->inet_saddr;
 	p->sport = inet->inet_sport;
@@ -100,10 +122,11 @@ static inline void copy_to_tcp_probe(const struct sock *sk, const struct sk_buff
 	p->snd_nxt = tp->snd_nxt;           // SN of the next segment to be sent (*)
 	p->snd_una = tp->snd_una;           // oldest unacknowledged SN (*)
 	p->snd_cwnd = tp->snd_cwnd;
-    p->packets_out = tp->packets_out;   // Packets which are "in flight"
+	p->packets_out = tp->packets_out;   // Packets which are "in flight"
 	p->snd_wnd = tp->snd_wnd;           // Size of the send window (*)
 	p->rcv_wnd = tp->rcv_wnd;
 	p->ssthresh = tcp_current_ssthresh(sk);
+	p->icsk_rto = inet_csk(sk)->icsk_rto;	// Retransmit timeout (used to determine slow-restart timeout)
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(3,14,0)
 	p->srtt = tp->srtt >> 3;
 #else
@@ -115,29 +138,29 @@ static inline void copy_to_tcp_probe(const struct sock *sk, const struct sk_buff
 	return;	
 }
 
-static inline int tcpprobe_sprint(const struct tcp_log *p, char *tbuf, int n)
+static int tcpprobe_sprint(const struct tcp_log *p, char *tbuf, int n)
 {
-	struct timespec tv
-		= ktime_to_timespec(ktime_sub(ktime_get(), tcp_probe.start));
+	struct timespec tv = ktime_to_timespec(ktime_sub(ktime_get(), tcp_probe.start));
 
-    unsigned int unacked_data      = p->snd_nxt - p->snd_una;
-    unsigned int window_space_left = p->snd_wnd - unacked_data;
+	unsigned int unacked_data      = p->snd_nxt - p->snd_una;
+	unsigned int window_space_left = p->snd_wnd - unacked_data;
 	int ret = scnprintf(tbuf, n,
-			"%4lu.%09lu %pI4:%u %pI4:%u %3d %#x %#x | %3u/%3u : %u %u %u %u | %u %u\n",
+			"[%4lu.%09lu] %4s: %pI4:%u %pI4:%u | CWND %3u/%3u | UNACK %6u/%6u - LEFT %u | rcv_wnd=%u ssthresh=%u srtt=%u rto=%u\n",
 			(unsigned long) tv.tv_sec,
 			(unsigned long) tv.tv_nsec,
+			logtype2str(p->type),
 			&p->saddr, ntohs(p->sport),
 			&p->daddr, ntohs(p->dport),
-			p->length, p->snd_nxt, p->snd_una,
-
-			p->packets_out, p->snd_cwnd, p->rcv_wnd, p->ssthresh, p->snd_wnd, p->srtt,
-
-            unacked_data, window_space_left);
+			p->packets_out, p->snd_cwnd,		// CONG
+			unacked_data, p->snd_wnd,		// UNACK
+			window_space_left,
+			p->rcv_wnd, p->ssthresh, p->srtt,
+			p->icsk_rto);
 
 	return ret;
 }
 
-static inline void tcpprobe_add_probe(struct sock *sk, struct sk_buff *skb) {
+static inline void tcpprobe_add_probe(const struct sock *sk, const struct sk_buff *skb, int type) {
 	
 	const struct tcp_sock *tp = tcp_sk(sk);
 	const struct inet_sock *inet = inet_sk(sk);
@@ -147,7 +170,7 @@ static inline void tcpprobe_add_probe(struct sock *sk, struct sk_buff *skb) {
 
 	u32 sport, dport;
 
-	if (skb != NULL) {
+	if (0 && skb != NULL) {
 		th = tcp_hdr(skb);
 		dport =	ntohs(th->dest);
 		sport =	ntohs(th->source);
@@ -155,7 +178,7 @@ static inline void tcpprobe_add_probe(struct sock *sk, struct sk_buff *skb) {
 		sport = ntohs(inet->inet_sport);
 		dport = ntohs(inet->inet_dport);
 	}
-	
+
 	if ((port == 0 || sport == port || dport == port) &&
 	    (full || tp->snd_cwnd != tcp_probe.lastcwnd)) {
 		
@@ -170,7 +193,7 @@ static inline void tcpprobe_add_probe(struct sock *sk, struct sk_buff *skb) {
 
 		if (CIRC_SPACE(head, tail, bufsize) >= 1) {
 			struct tcp_log *p = tcp_probe.log + tcp_probe.head;
-			copy_to_tcp_probe (sk, skb, p);
+			copy_to_tcp_probe (sk, skb, p, type);
 
 			tcp_probe.head = (head + 1) & (bufsize - 1);
 
@@ -187,59 +210,69 @@ static inline void tcpprobe_add_probe(struct sock *sk, struct sk_buff *skb) {
  * Hook inserted to be called before each receive packet.
  * Note: arguments must match tcp_rcv_established()!
  */
-static int jtcp_rcv_established(struct sock *sk, struct sk_buff *skb,
-			       struct tcphdr *th, unsigned len) {
-	
-	tcpprobe_add_probe (sk, skb);
+static int jtcp_rcv_established(struct sock *sk, struct sk_buff *skb, struct tcphdr *th, unsigned len)
+{
+	tcpprobe_add_probe (sk, skb, LogType_Rx);
 	jprobe_return();
 	return 0;
 }
-/* Other functions that we could use to hook in */
-/*
-static void jbictcp_cong_avoid_ai (struct tcp_sock *tp, u32 w) {
-	printk("jbictcp_cong_avoid_ai\n");
-	tcpprobe_add_probe (tp, NULL);
-	jprobe_return();
-}
-static void jbictcp_cong_avoid(struct sock *sk, u32 ack, u32 in_flight) {
-	tcpprobe_add_probe (sk, NULL);
-	jprobe_return();
+
+static int jtcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it, gfp_t gfp_mask)
+{
+	tcpprobe_add_probe (sk, skb, LogType_Tx);
+        jprobe_return();
+        return 0;
 }
 
-static void jbictcp_acked(struct sock *sk, u32 cnt, s32 tt_us) {
-	
-	tcpprobe_add_probe (sk, NULL);
-	jprobe_return();
-}
-*/
-
-static struct jprobe tcp_jprobe = {
-	.kp = {
-		//.symbol_name	= "bictcp_cong_avoid",
-		//.symbol_name	= "tcp_cong_avoid_ai",
-		//.symbol_name	= "bictcp_acked",
-		.symbol_name	= "tcp_rcv_established",
-	},
-	.entry	= jtcp_rcv_established,
-	//.entry	= jbictcp_cong_avoid,
-	//.entry	= jbictcp_acked,
-	//.entry	= jbictcp_cong_avoid_ai,
-	//.entry	= jbictcp_update,
+static struct jprobe jp_rx = {
+	.kp.symbol_name = "tcp_rcv_established",
+	.entry = jtcp_rcv_established
+};
+static struct jprobe jp_tx = {
+	.kp.symbol_name = "tcp_transmit_skb",
+	.entry = jtcp_transmit_skb
+};
+static struct jprobe *tcp_jprobe[] = {
+	&jp_rx,
+	&jp_tx,
 };
 
-static int jip_queue_xmit(struct sock *sk, struct sk_buff *skb, struct flowi *fl)
+
+struct rethandler_event_data {
+	struct sock *sk;
+	struct sk_buff *skb;
+};
+
+static int entry_hander_tcp_event_new_data_sent(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    // Can we pass the SKB, or does it expect a TCP sbk only?
-    tcpprobe_add_probe (sk, /*skb*/NULL);
-    jprobe_return();
-    return 0;
+	struct rethandler_event_data *data = (struct rethandler_event_data *)ri->data;
+
+	// FIXME: this is x64 specific
+	data->sk = (struct sock *)regs->di;
+	data->skb = (struct sk_buff *)regs->si;
+
+	return 0;
 }
 
-static struct jprobe ip_jprobe = {
-    .kp = {
-        .symbol_name    = "ip_queue_xmit",
-    },
-    .entry = jip_queue_xmit,
+static int ret_handler_tcp_event_new_data_sent(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	static struct sock *prev_sk = NULL;
+	struct rethandler_event_data *data = (struct rethandler_event_data *)ri->data;
+
+	tcpprobe_add_probe (data->sk, data->skb, LogType_Stats);	
+
+	return 0;
+}
+
+static struct kretprobe retp_event = {
+	.handler	= ret_handler_tcp_event_new_data_sent,
+	.entry_handler	= entry_hander_tcp_event_new_data_sent,
+	.data_size	= sizeof(struct rethandler_event_data),
+	.maxactive	= 20,
+	.kp.symbol_name	= "tcp_event_new_data_sent"
+};
+static struct kretprobe *tcp_kprobe[] = {
+	&retp_event
 };
 
 static int tcpprobe_open(struct inode * inode, struct file * file)
@@ -268,7 +301,7 @@ static ssize_t tcpprobe_read(struct file *file, char __user *buf,
 		return -EINVAL;
 
 	while (eventbuf > 0 && cnt < len) {
-		char tbuf[163];
+		char tbuf[512];
 		int width = 0;
 		unsigned long head, tail;
 		
@@ -318,24 +351,14 @@ static ssize_t tcpprobe_read(struct file *file, char __user *buf,
 	return cnt == 0 ? error : cnt;
 }
 
-/*
-static int tcpprobe_write (struct file *file, const char *buf,
-	size_t count, loff_t *off) {
-
-	return -EFAULT;
-}
-*/
-
 static int tcpprobe_release(struct inode *inode, struct file *file) {
 	
-	//printk("closing\n");
 	return 0;
 }
 
 static const struct file_operations tcpprobe_fops = {
 	.owner	 = THIS_MODULE,
 	.open	 = tcpprobe_open,
-	//.write	 = tcpprobe_write,
 	.release = tcpprobe_release,
 	.read    = tcpprobe_read,
 	.llseek  = noop_llseek,
@@ -361,10 +384,13 @@ static __init int tcpprobe_init(void)
 	if (!proc_create(procname, S_IRUSR, init_net.proc_net, &tcpprobe_fops))
 		goto err0;
 
-	ret = register_jprobe(&tcp_jprobe);
+	ret = register_jprobes(tcp_jprobe, ARRAY_SIZE(tcp_jprobe));
 	if (ret) goto err1;
-    ret = register_jprobe(&ip_jprobe);
-    if (ret) goto err1;
+	ret = register_kretprobes(tcp_kprobe, ARRAY_SIZE(tcp_kprobe));
+	if (ret) {
+		unregister_jprobes(tcp_jprobe, ARRAY_SIZE(tcp_jprobe));
+		goto err1;
+	}
 
 	pr_info("TCP probe registered (port=%d) bufsize=%u\n", port, bufsize);
 	return 0;
@@ -379,8 +405,8 @@ module_init(tcpprobe_init);
 static __exit void tcpprobe_exit(void)
 {
 	remove_proc_entry(procname, init_net.proc_net);
-    unregister_jprobe(&ip_jprobe);
-	unregister_jprobe(&tcp_jprobe);
+	unregister_kretprobes(tcp_kprobe, ARRAY_SIZE(tcp_kprobe));
+	unregister_jprobes(tcp_jprobe, ARRAY_SIZE(tcp_jprobe));
 	kfree(tcp_probe.log);
 }
 module_exit(tcpprobe_exit);
