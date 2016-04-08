@@ -70,6 +70,7 @@ struct tcp_log {
 	u32	snd_una;
 	u32	snd_wnd;
 	u32 rcv_wnd;
+    u32 packets_out;
 	u32	snd_cwnd;
 	u32	ssthresh;
 	u32	srtt;
@@ -96,10 +97,11 @@ static inline void copy_to_tcp_probe(const struct sock *sk, const struct sk_buff
 	p->sport = inet->inet_sport;
 	p->daddr = inet->inet_daddr;
 	p->dport = inet->inet_dport;
-	p->snd_nxt = tp->snd_nxt;
-	p->snd_una = tp->snd_una;
+	p->snd_nxt = tp->snd_nxt;           // SN of the next segment to be sent (*)
+	p->snd_una = tp->snd_una;           // oldest unacknowledged SN (*)
 	p->snd_cwnd = tp->snd_cwnd;
-	p->snd_wnd = tp->snd_wnd;
+    p->packets_out = tp->packets_out;   // Packets which are "in flight"
+	p->snd_wnd = tp->snd_wnd;           // Size of the send window (*)
 	p->rcv_wnd = tp->rcv_wnd;
 	p->ssthresh = tcp_current_ssthresh(sk);
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(3,14,0)
@@ -118,14 +120,19 @@ static inline int tcpprobe_sprint(const struct tcp_log *p, char *tbuf, int n)
 	struct timespec tv
 		= ktime_to_timespec(ktime_sub(ktime_get(), tcp_probe.start));
 
+    unsigned int unacked_data      = p->snd_nxt - p->snd_una;
+    unsigned int window_space_left = p->snd_wnd - unacked_data;
 	int ret = scnprintf(tbuf, n,
-			"%lu.%09lu %pI4:%u %pI4:%u %d %#x %#x %u %u %u %u %u\n",
+			"%4lu.%09lu %pI4:%u %pI4:%u %3d %#x %#x | %3u/%3u : %u %u %u %u | %u %u\n",
 			(unsigned long) tv.tv_sec,
 			(unsigned long) tv.tv_nsec,
 			&p->saddr, ntohs(p->sport),
 			&p->daddr, ntohs(p->dport),
 			p->length, p->snd_nxt, p->snd_una,
-			p->snd_cwnd, p->rcv_wnd, p->ssthresh, p->snd_wnd, p->srtt);
+
+			p->packets_out, p->snd_cwnd, p->rcv_wnd, p->ssthresh, p->snd_wnd, p->srtt,
+
+            unacked_data, window_space_left);
 
 	return ret;
 }
@@ -218,6 +225,21 @@ static struct jprobe tcp_jprobe = {
 	//.entry	= jbictcp_acked,
 	//.entry	= jbictcp_cong_avoid_ai,
 	//.entry	= jbictcp_update,
+};
+
+static int jip_queue_xmit(struct sock *sk, struct sk_buff *skb, struct flowi *fl)
+{
+    // Can we pass the SKB, or does it expect a TCP sbk only?
+    tcpprobe_add_probe (sk, /*skb*/NULL);
+    jprobe_return();
+    return 0;
+}
+
+static struct jprobe ip_jprobe = {
+    .kp = {
+        .symbol_name    = "ip_queue_xmit",
+    },
+    .entry = jip_queue_xmit,
 };
 
 static int tcpprobe_open(struct inode * inode, struct file * file)
@@ -340,8 +362,9 @@ static __init int tcpprobe_init(void)
 		goto err0;
 
 	ret = register_jprobe(&tcp_jprobe);
-	if (ret)
-		goto err1;
+	if (ret) goto err1;
+    ret = register_jprobe(&ip_jprobe);
+    if (ret) goto err1;
 
 	pr_info("TCP probe registered (port=%d) bufsize=%u\n", port, bufsize);
 	return 0;
@@ -356,6 +379,7 @@ module_init(tcpprobe_init);
 static __exit void tcpprobe_exit(void)
 {
 	remove_proc_entry(procname, init_net.proc_net);
+    unregister_jprobe(&ip_jprobe);
 	unregister_jprobe(&tcp_jprobe);
 	kfree(tcp_probe.log);
 }
