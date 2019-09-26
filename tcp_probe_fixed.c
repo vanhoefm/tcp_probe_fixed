@@ -217,20 +217,33 @@ static int jtcp_rcv_established(struct sock *sk, struct sk_buff *skb, struct tcp
 	return 0;
 }
 
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,17,0)
 static int jtcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it, gfp_t gfp_mask)
 {
 	tcpprobe_add_probe (sk, skb, LogType_Tx);
-        jprobe_return();
-        return 0;
+	jprobe_return();
+	return 0;
 }
+#else
+static void jtcp_rate_skb_sent(struct sock *sk, struct sk_buff *skb)
+{
+	tcpprobe_add_probe (sk, skb, LogType_Tx);
+	jprobe_return();
+}
+#endif
 
 static struct jprobe jp_rx = {
 	.kp.symbol_name = "tcp_rcv_established",
 	.entry = jtcp_rcv_established
 };
 static struct jprobe jp_tx = {
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,17,0)
 	.kp.symbol_name = "tcp_transmit_skb",
 	.entry = jtcp_transmit_skb
+#else
+	.kp.symbol_name = "tcp_rate_skb_sent",
+	.entry = jtcp_rate_skb_sent
+#endif
 };
 static struct jprobe *tcp_jprobe[] = {
 	&jp_rx,
