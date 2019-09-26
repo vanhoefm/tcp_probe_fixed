@@ -66,7 +66,8 @@ static const char procname[] = "tcpprobe";
 enum LogType {
 	LogType_Rx,
 	LogType_Tx,
-	LogType_Stats
+	LogType_Stats,
+	LogType_User
 };
 
 const char *logtype2str(enum LogType type)
@@ -75,6 +76,7 @@ const char *logtype2str(enum LogType type)
 	case LogType_Rx:    return "RECV";
 	case LogType_Tx:    return "XMIT";
 	case LogType_Stats: return "INFO";
+	case LogType_User:  return "USER";
 	}
 
 	return "??";
@@ -103,12 +105,15 @@ static struct {
 	ktime_t		start;
 	u32		lastcwnd;
 
+	/** Current position in the circular buffer */
 	unsigned long	head, tail;
+
+	/** Pointer to the start of the circular buffer */
 	struct tcp_log	*log;
 } tcp_probe;
 
 /* copies the probe data from the socket */
-static inline void copy_to_tcp_probe(const struct sock *sk, const struct sk_buff *skb, struct tcp_log *p, enum LogType type) {
+static inline void copy_to_tcp_probe(const struct sock *sk, size_t length, struct tcp_log *p, enum LogType type) {
 
 	const struct tcp_sock *tp = tcp_sk(sk);
 	const struct inet_sock *inet = inet_sk(sk);
@@ -133,7 +138,8 @@ static inline void copy_to_tcp_probe(const struct sock *sk, const struct sk_buff
 	p->srtt = tp->srtt_us >> 3;
 #endif
 
-	p->length = skb == NULL ? 0 : skb->len;
+	// skb == NULL ? 0 : skb->len
+	p->length = length;
 	
 	return;	
 }
@@ -144,8 +150,12 @@ static int tcpprobe_sprint(const struct tcp_log *p, char *tbuf, int n)
 
 	unsigned int unacked_data      = p->snd_nxt - p->snd_una;
 	unsigned int window_space_left = p->snd_wnd - unacked_data;
-	int ret = scnprintf(tbuf, n,
-			"[%4lu.%09lu] %4s: %pI4:%u %pI4:%u | CWND %3u/%3u | UNACK %6u/%6u - LEFT %u | rcv_wnd=%u ssthresh=%u srtt=%u rto=%u\n",
+	int ret;
+
+	if (p->type != LogType_User)
+	{
+		ret = scnprintf(tbuf, n,
+			"[%4lu.%09lu] %4s: %pI4:%u %pI4:%u | CWND %3u/%3u | UNACK %6u/%6u - LEFT %5u | rcv_wnd=%u ssthresh=%u srtt=%u rto=%u\n",
 			(unsigned long) tv.tv_sec,
 			(unsigned long) tv.tv_nsec,
 			logtype2str(p->type),
@@ -156,28 +166,33 @@ static int tcpprobe_sprint(const struct tcp_log *p, char *tbuf, int n)
 			window_space_left,
 			p->rcv_wnd, p->ssthresh, p->srtt,
 			p->icsk_rto);
+	}
+	else
+	{
+		ret = scnprintf(tbuf, n,
+			"[%4lu.%09lu] %4s: %pI4:%u %pI4:%u | CWND %3u/%3u | UNACK %6u/%6u - LEFT %5u | USER WRITE %u\n",
+			(unsigned long) tv.tv_sec,
+			(unsigned long) tv.tv_nsec,
+			logtype2str(p->type),
+			&p->saddr, ntohs(p->sport),
+			&p->daddr, ntohs(p->dport),
+			p->packets_out, p->snd_cwnd,		// CONG
+			unacked_data, p->snd_wnd,		// UNACK
+			window_space_left,
+			p->length);
+	}
 
 	return ret;
 }
 
-static inline void tcpprobe_add_probe(const struct sock *sk, const struct sk_buff *skb, int type) {
+static inline void tcpprobe_add_probe(const struct sock *sk, size_t msglen, int type) {
 	
 	const struct tcp_sock *tp = tcp_sk(sk);
 	const struct inet_sock *inet = inet_sk(sk);
-	
-	struct tcphdr *th;
 	unsigned int head,tail;
 
-	u32 sport, dport;
-
-	if (0 && skb != NULL) {
-		th = tcp_hdr(skb);
-		dport =	ntohs(th->dest);
-		sport =	ntohs(th->source);
-	} else {
-		sport = ntohs(inet->inet_sport);
-		dport = ntohs(inet->inet_dport);
-	}
+	u32 sport = ntohs(inet->inet_sport);
+	u32 dport = ntohs(inet->inet_dport);
 
 	if ((port == 0 || sport == port || dport == port) &&
 	    (full || tp->snd_cwnd != tcp_probe.lastcwnd)) {
@@ -193,7 +208,7 @@ static inline void tcpprobe_add_probe(const struct sock *sk, const struct sk_buf
 
 		if (CIRC_SPACE(head, tail, bufsize) >= 1) {
 			struct tcp_log *p = tcp_probe.log + tcp_probe.head;
-			copy_to_tcp_probe (sk, skb, p, type);
+			copy_to_tcp_probe(sk, msglen, p, type);
 
 			tcp_probe.head = (head + 1) & (bufsize - 1);
 
@@ -212,7 +227,8 @@ static inline void tcpprobe_add_probe(const struct sock *sk, const struct sk_buf
  */
 static int jtcp_rcv_established(struct sock *sk, struct sk_buff *skb, struct tcphdr *th, unsigned len)
 {
-	tcpprobe_add_probe (sk, skb, LogType_Rx);
+	size_t msglen = skb == NULL ? 0 : skb->len;
+	tcpprobe_add_probe(sk, msglen, LogType_Rx);
 	jprobe_return();
 	return 0;
 }
@@ -220,14 +236,16 @@ static int jtcp_rcv_established(struct sock *sk, struct sk_buff *skb, struct tcp
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(3,17,0)
 static int jtcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it, gfp_t gfp_mask)
 {
-	tcpprobe_add_probe (sk, skb, LogType_Tx);
+	size_t msglen = skb == NULL ? 0 : skb->len;
+	tcpprobe_add_probe(sk, msglen, LogType_Tx);
 	jprobe_return();
 	return 0;
 }
 #else
 static void jtcp_rate_skb_sent(struct sock *sk, struct sk_buff *skb)
 {
-	tcpprobe_add_probe (sk, skb, LogType_Tx);
+	size_t msglen = skb == NULL ? 0 : skb->len;
+	tcpprobe_add_probe(sk, msglen, LogType_Tx);
 	jprobe_return();
 }
 #endif
@@ -270,8 +288,22 @@ static int entry_hander_tcp_event_new_data_sent(struct kretprobe_instance *ri, s
 static int ret_handler_tcp_event_new_data_sent(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct rethandler_event_data *data = (struct rethandler_event_data *)ri->data;
+	size_t msglen = data->skb == NULL ? 0 : data->skb->len;
 
-	tcpprobe_add_probe (data->sk, data->skb, LogType_Stats);	
+	tcpprobe_add_probe(data->sk, msglen, LogType_Stats);
+
+	return 0;
+}
+
+static int entry_hander_tcp_sendmsg(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	// FIXME: this is x64 specific
+	struct sock *sk = (struct sock *)regs->di;
+	//struct msghdr *msg = (struct msghdr *)regs->si;
+	size_t len = regs->dx;
+
+	// FIXME: Should this be done after windows have been updated?
+	tcpprobe_add_probe(sk, len, LogType_User);
 
 	return 0;
 }
@@ -283,8 +315,16 @@ static struct kretprobe retp_event = {
 	.maxactive	= 20,
 	.kp.symbol_name	= "tcp_event_new_data_sent"
 };
+static struct kretprobe retp_tcp_sendmsg = {
+	.handler	= NULL,
+	.entry_handler	= entry_hander_tcp_sendmsg,
+	.data_size	= sizeof(struct rethandler_event_data),
+	.maxactive	= 20,
+	.kp.symbol_name	= "tcp_sendmsg"
+};
 static struct kretprobe *tcp_kprobe[] = {
-	&retp_event
+	&retp_event,
+	&retp_tcp_sendmsg
 };
 
 static int tcpprobe_open(struct inode * inode, struct file * file)
