@@ -269,7 +269,6 @@ static int entry_hander_tcp_event_new_data_sent(struct kretprobe_instance *ri, s
 
 static int ret_handler_tcp_event_new_data_sent(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	static struct sock *prev_sk = NULL;
 	struct rethandler_event_data *data = (struct rethandler_event_data *)ri->data;
 
 	tcpprobe_add_probe (data->sk, data->skb, LogType_Stats);	
