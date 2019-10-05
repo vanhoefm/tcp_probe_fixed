@@ -2,5 +2,5 @@
 set -e
 
 make
-rmmod tcp_probe_fixed || true
-insmod tcp_probe_fixed.ko port=80 full=1
+sudo rmmod tcp_probe_fixed || true
+sudo insmod tcp_probe_fixed.ko port=2083 full=1
